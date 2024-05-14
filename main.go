@@ -1,12 +1,10 @@
 package main
 
 import (
-	"context"
 	"errors"
 	"io"
 	"net"
 	"os"
-	"os/signal"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -29,6 +27,8 @@ const (
 )
 
 // TODO: to refactor (e.g. move methods under Driver struct)
+// TODO: to add re-dialing (restoring) connection after loose
+
 func main() {
 	setLogger()
 
@@ -46,81 +46,65 @@ func main() {
 		}
 	}()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	go signalListener(cancel)
-	go writePing(ctx, conn)
-
-	bufCh := make(chan []byte)
+	go writePing(conn)
 
 	// response packet reader
 	for {
-		go func() {
-			buf := make([]byte, 14)
-			_, err := io.ReadFull(conn, buf)
-			if err != nil {
-				log.Error().Err(err).Msg("failed to read")
-				return
+		buf := make([]byte, 14)
+		n, err := io.ReadFull(conn, buf)
+		if err != nil {
+			if n == 0 && errors.Is(err, io.EOF) {
+				continue
 			}
 
-			if len(buf) < 10 {
-				log.Error().Uints8("buf", buf).Msg("packet len is below required")
-				return
-			}
+			log.Error().Err(err).Msg("failed to read")
+			continue
+		}
 
-			bufCh <- buf
-		}()
+		if len(buf) < 14 {
+			log.Error().Uints8("buf", buf).Msg("packet len is below required")
+			continue
+		}
 
-		select {
-		case <-ctx.Done():
-			log.Debug().Msg("reader done")
-			return
-		case buf := <-bufCh:
-			switch buf[1] {
-			case packetTypePong:
-				log.Debug().Msg("pong")
-			default:
-				log.Error().Uints8("buf", buf).Msg("unknown packet type")
-			}
+		switch buf[1] {
+		case packetTypePong:
+			log.Debug().Msg("pong")
+		default:
+			log.Error().Uints8("buf", buf).Msg("unknown packet type")
 		}
 	}
 }
 
-func writePing(ctx context.Context, conn net.Conn) {
+func writePing(conn net.Conn) {
 	ticker := time.NewTicker(5 * time.Second)
 	var faultPingCount int
 
-	for {
+	for range ticker.C {
 		if faultPingCount == 10 {
 			if err := conn.Close(); err != nil {
-				log.Fatal().Err(err).Msg("failed to close conn")
+				log.Error().Err(err).Msg("failed to close conn")
 			}
 			log.Fatal().Msg("faulty ping limit exceeded")
 		}
 
-		select {
-		case <-ctx.Done():
-			log.Debug().Msg("write ping done")
-			ticker.Stop()
-			return
-		case <-ticker.C:
-			header := make([]byte, 4)
-			header[0] = protocolVersion1
-			header[1] = packetTypePing
+		header := make([]byte, 4)
+		header[0] = protocolVersion1
+		header[1] = packetTypePing
 
-			body := make([]byte, 10)
+		body := make([]byte, 10)
 
-			packet := append(header, body...)
-			log.Debug().Msg("ping")
+		packet := append(header, body...)
 
-			_, err := conn.Write(packet)
-			if err != nil {
-				faultPingCount++
-				if !errors.Is(err, unix.EPIPE) { // ignore broken pipe error on server fault
-					log.Error().Err(err).Msg("failed to write ping packet")
-					continue
-				}
+		_, err := conn.Write(packet)
+		if err != nil {
+			faultPingCount++
+			if !errors.Is(err, unix.EPIPE) { // ignore broken pipe error on server fault
+				log.Error().Err(err).Msg("failed to write ping packet")
+				continue
 			}
 		}
+
+		log.Debug().Msg("ping")
 	}
 }
 
@@ -138,13 +122,4 @@ func setLogger() {
 
 	zerolog.SetGlobalLevel(zeroLvl)
 	log.Info().Str("set_level", zeroLvl.String()).Msg("logger is set")
-}
-
-func signalListener(cancel context.CancelFunc) {
-	signalCh := make(chan os.Signal, 1)
-	signal.Notify(signalCh, unix.SIGINT, unix.SIGTERM, unix.SIGKILL, unix.SIGSTOP)
-
-	sig := <-signalCh
-	log.Info().Str("signal", sig.String()).Msg("signal received")
-	cancel()
 }
