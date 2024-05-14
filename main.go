@@ -80,7 +80,7 @@ func writePing(conn net.Conn) {
 	var faultPingCount int
 
 	for range ticker.C {
-		if faultPingCount == 10 {
+		if faultPingCount == 10 { // TODO: 10 packets sequentially, not in summary
 			if err := conn.Close(); err != nil {
 				log.Error().Err(err).Msg("failed to close conn")
 			}
