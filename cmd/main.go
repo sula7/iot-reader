@@ -9,8 +9,9 @@ import (
 
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
-	"github.com/sula7/iot-reader/internal/packet"
 	"golang.org/x/sys/unix"
+
+	"github.com/sula7/iot-reader/internal/packet"
 )
 
 // header (4 bytes):
@@ -28,30 +29,30 @@ const (
 )
 
 // TODO: to refactor (e.g. move methods under Driver struct)
-// TODO: to add re-dialing (restoring) connection after loose
 
 func main() {
 	setLogger()
 
 	dialAddress := os.Getenv("DIAL_ADDRESS")
 
-	reconnectCh := make(chan struct{})
 	var (
-		reconnectRetryCount     = 3
+		reconnectRetryCount     = 4
 		reconnectRetryDelay     = 0 * time.Second
 		reconnectRetryDelayStep = 5 * time.Second
 	)
 
 RECONN:
 	for n := range reconnectRetryCount {
-		time.Sleep(reconnectRetryDelay)
+		if reconnectRetryDelay > 0 {
+			log.Debug().Int("retry_no", n).
+				Msgf("reconnecting to the server in %s seconds", reconnectRetryDelay)
+			time.Sleep(reconnectRetryDelay)
+		}
 
 		conn, err := net.DialTimeout("tcp", dialAddress, 10*time.Second)
 		if err != nil {
 			log.Error().Err(err).Msg("failed to dial tcp")
 			reconnectRetryDelay += reconnectRetryDelayStep
-			log.Debug().Int("retry_no", n).
-				Msgf("reconnecting to the server in %s seconds", reconnectRetryDelay)
 			continue
 		}
 
@@ -59,23 +60,19 @@ RECONN:
 			Str("local_address", conn.LocalAddr().String()).Msg("connected")
 
 		ctx, cancel := context.WithCancel(context.Background())
-		go writePing(ctx, conn, reconnectCh)
+		go writePing(ctx, cancel, conn)
 
 		dataCh := make(chan []byte)
-		go responseReceiver(ctx, conn, dataCh, reconnectCh)
+		go responseReceiver(ctx, cancel, conn, dataCh)
 
 		for {
 			select {
-			case <-reconnectCh:
-				cancel()
-
+			case <-ctx.Done():
 				if err := conn.Close(); err != nil {
 					log.Error().Err(err).Msg("failed to close conn")
 				}
 
 				reconnectRetryDelay += reconnectRetryDelayStep
-				log.Debug().Int("retry_no", n).
-					Msgf("reconnecting to the server in %s seconds", reconnectRetryDelay)
 				continue RECONN
 			case buf := <-dataCh:
 				switch buf[1] {
@@ -89,7 +86,7 @@ RECONN:
 	}
 }
 
-func writePing(ctx context.Context, conn net.Conn, reconnectCh chan<- struct{}) {
+func writePing(ctx context.Context, cancel context.CancelFunc, conn net.Conn) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
@@ -105,7 +102,7 @@ func writePing(ctx context.Context, conn net.Conn, reconnectCh chan<- struct{}) 
 	for range ticker.C {
 		select {
 		case <-ctx.Done():
-			log.Debug().Msg("ctx cancelled pinger")
+			log.Debug().Msg("ctx done for write ping")
 			return
 		default:
 		}
@@ -115,7 +112,7 @@ func writePing(ctx context.Context, conn net.Conn, reconnectCh chan<- struct{}) 
 			faultyPingCount++
 			if errors.Is(err, unix.EPIPE) && faultyPingCount == 5 {
 				log.Debug().Msg("faulty ping write count reached")
-				reconnectCh <- struct{}{}
+				cancel()
 				return
 			}
 
@@ -142,12 +139,11 @@ func setLogger() {
 	log.Info().Str("set_level", zeroLvl.String()).Msg("logger is set")
 }
 
-// TODO: this func consumes a lot of CPU time. Looks like for loop and io.IOF are bad
-func responseReceiver(ctx context.Context, conn net.Conn, dataCh chan<- []byte, reconnectCh chan<- struct{}) {
+func responseReceiver(ctx context.Context, cancel context.CancelFunc, conn net.Conn, dataCh chan<- []byte) {
 	for {
 		select {
 		case <-ctx.Done():
-			log.Debug().Msg("ctx cancelled responser")
+			log.Debug().Msg("ctx done for response receiver")
 			return
 		default:
 		}
@@ -158,7 +154,7 @@ func responseReceiver(ctx context.Context, conn net.Conn, dataCh chan<- []byte, 
 			if n == 0 {
 				log.Debug().Str("remote_address", conn.RemoteAddr().String()).
 					Str("local_address", conn.LocalAddr().String()).Msg("disconnected")
-				reconnectCh <- struct{}{}
+				cancel()
 				return
 			}
 
